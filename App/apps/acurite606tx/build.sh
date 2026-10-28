@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build one overlay-app blob (.app). Run from this app directory.
+# Build one overlay-app blob (.app). Meant to be launched from this app dir.
 set -euo pipefail
 
 APP="$(basename "$PWD")"
