@@ -3,6 +3,7 @@
  * - odwrócony plus/minus dla intuicji (UP = cieplej)
  * - poprawione wyświetlanie dla wartości >=10 (2 cyfry)
  * - cfg_load / cfg_save przez api
+ * - tryb pomiaru RF / OOK-ASK dla czujek meteo Acurite 606TX
  */
 
 #include <stdint.h>
@@ -24,6 +25,15 @@
 #define INPUT_TICK_MS           15u
 #define TEMP_REFRESH_TICKS      33u
 #define SAMPLE_COUNT            8u
+#define RF_BITS_MAX             96u
+#define RF_LEVEL_THRESHOLD      1500u
+#define RF_PULSE_CLASSIFY       6u
+#define RF_TUNE_STEP_KHZ        1000
+
+enum {
+    MODE_TEMPERATURE = 0u,
+    MODE_RF = 1u,
+};
 
 struct thermo_cfg {
     int16_t offset_tenths;
@@ -38,7 +48,7 @@ struct globals {
     uint8_t sample_idx;
     uint8_t sample_cnt;
     int16_t filtered_raw;
-    int16_t comp_offset_tenths; // wewnętrznie: dodatnie = grzanie do odjęcia
+    int16_t comp_offset_tenths;
     int16_t ambient_tenths;
     uint16_t vdd_mv;
     bool valid;
@@ -48,6 +58,14 @@ struct globals {
     bool dirty;
     bool suspended;
     bool cfg_dirty;
+    uint8_t mode;
+    bool rf_active;
+    bool rf_monitor;
+    int16_t rf_shift_khz;
+    uint16_t rf_last_level;
+    uint16_t rf_pulse_count;
+    char rf_bits[RF_BITS_MAX + 1u];
+    uint16_t rf_bit_count;
 };
 
 static struct globals g;
@@ -67,7 +85,7 @@ static bool adc_read_channel(volatile uint32_t *adc, uint8_t channel, uint16_t *
 }
 
 static void cfg_load(void) {
-    g.comp_offset_tenths = 85; // 8.5C default
+    g.comp_offset_tenths = 85;
     struct thermo_cfg cfg;
     if (A->cfg_load) {
         A->cfg_load((uint8_t *)&cfg, sizeof(cfg));
@@ -171,10 +189,121 @@ static void format_temp_big(char *out, int16_t tenths, bool fahrenheit){
     *p++=fahrenheit?'F':'C'; *p='\0';
 }
 
+static uint32_t rf_target_freq_10hz(void) {
+    return (uint32_t)((int32_t)A->rx_freq() + (int32_t)g.rf_shift_khz * 100);
+}
+
+static void rf_set_freq_from_vfo(void) {
+    uint32_t freq10 = rf_target_freq_10hz();
+    A->bk_write(0x38u, (uint16_t)(freq10 & 0xFFFFu));
+    A->bk_write(0x39u, (uint16_t)(freq10 >> 16u));
+    A->tones_off_rx();
+    A->set_agc(false);
+    A->audio_path(false);
+    A->set_af(APP_AF_AM);
+}
+
+static void rf_enter(void) {
+    g.mode = MODE_RF;
+    g.rf_active = true;
+    g.rf_monitor = false;
+    g.rf_shift_khz = 0;
+    g.rf_last_level = 0u;
+    g.rf_pulse_count = 0u;
+    g.rf_bit_count = 0u;
+    g.rf_bits[0] = '\0';
+    rf_set_freq_from_vfo();
+    A->af_capture_open();
+    A->set_af(APP_AF_AM);
+    A->audio_path(false);
+    g.dirty = true;
+}
+
+static void rf_exit(void) {
+    if (g.rf_active) {
+        A->af_capture_close();
+        g.rf_active = false;
+    }
+    g.mode = MODE_TEMPERATURE;
+    g.rf_monitor = false;
+    A->audio_path(false);
+    A->set_af(APP_AF_MUTE);
+    g.dirty = true;
+}
+
+static void rf_sample_bitstream(void) {
+    if (!g.rf_active) return;
+    uint16_t sample = A->af_capture_sample();
+    uint8_t level = (sample > RF_LEVEL_THRESHOLD) ? 1u : 0u;
+
+    if (level != g.rf_last_level) {
+        g.rf_last_level = level;
+        if (g.rf_pulse_count > 1u && g.rf_pulse_count < 64u) {
+            char bit = (g.rf_pulse_count > RF_PULSE_CLASSIFY) ? '1' : '0';
+            if (g.rf_bit_count < RF_BITS_MAX) {
+                g.rf_bits[g.rf_bit_count++] = bit;
+                g.rf_bits[g.rf_bit_count] = '\0';
+            }
+        }
+        g.rf_pulse_count = 1u;
+    } else {
+        g.rf_pulse_count++;
+    }
+}
+
+static void format_rf_freq(char *out, uint32_t freq10hz) {
+    uint32_t hz = freq10hz * 10u;
+    uint32_t mhz = hz / 1000000u;
+    uint32_t khz = (hz / 1000u) % 1000u;
+    uint32_t h = hz % 1000u;
+    char *p = out;
+    *p++ = '0' + (mhz / 100u) % 10u;
+    *p++ = '0' + (mhz / 10u) % 10u;
+    *p++ = '0' + mhz % 10u;
+    *p++ = '.';
+    *p++ = '0' + khz / 100u;
+    *p++ = '0' + (khz / 10u) % 10u;
+    *p++ = '0' + khz % 10u;
+    *p++ = '.';
+    *p++ = '0' + h / 100u;
+    *p++ = '0' + (h / 10u) % 10u;
+    *p++ = '0' + h % 10u;
+    *p = '\0';
+}
+
+static void draw_rf_debug(void) {
+    char freq[16];
+    char bits[RF_BITS_MAX + 1u];
+    uint8_t n = 0u;
+    format_rf_freq(freq, rf_target_freq_10hz());
+
+    A->display_clear();
+    A->status_clear();
+    A->print_normal("RF OOK/ASK", 0, 0, 0);
+    A->print_normal(freq, 0, 0, 1);
+    A->print_normal(g.rf_monitor ? "MONITOR ON" : "READY", 0, 0, 2);
+
+    for (uint16_t i = 0u; i < g.rf_bit_count && i < 32u; i++) {
+        bits[n++] = g.rf_bits[i];
+    }
+    bits[n] = '\0';
+    A->print_normal(bits[0] ? bits : "WAITING", 0, 0, 4);
+    A->print_normal("UP/DN +/-1kHz 2=RF 3=MON", 0, 0, 6);
+    A->draw_battery();
+    A->blit_status();
+    A->blit_full();
+}
+
 static void draw(void){
     char buf[16]; char small[32];
     char title[T_TITLE_LEN];
     char adc_err[T_ADC_ERR_LEN];
+
+    if (g.mode == MODE_RF) {
+        draw_rf_debug();
+        return;
+    }
+
     A->asset_read(T_TITLE, title, sizeof(title));
     A->display_clear();
     A->status_clear();
@@ -212,7 +341,6 @@ static void draw(void){
         *o++='C';
         *o++=' ';
         for(const char *p = cmp_label; *p; p++) *o++ = *p;
-        // odwrócony plus/minus dla intuicji: wyswietlamy -offset (korekta dodawana do RAW)
         int16_t disp_off = -g.comp_offset_tenths;
         if(disp_off==0){
             *o++='0'; *o++='.'; *o++='0';
@@ -254,6 +382,8 @@ __attribute__((section(".text.entry"), used))
 void app_main(const app_api_t *api){
     g.api=api;
     g.sample_idx=0; g.sample_cnt=0; g.show_f=false; g.running=true; g.dirty=true; g.suspended=false; g.cfg_dirty=false;
+    g.mode = MODE_TEMPERATURE;
+    g.rf_active=false; g.rf_monitor=false; g.rf_shift_khz=0; g.rf_last_level=0u; g.rf_pulse_count=0u; g.rf_bit_count=0u; g.rf_bits[0]='\0';
     for(uint8_t i=0;i<SAMPLE_COUNT;i++) g.samples[i]=0;
 
     cfg_load();
@@ -274,30 +404,53 @@ void app_main(const app_api_t *api){
         else if(key==APP_KEY_INVALID){ previous=key; repeat_ms=0; }
         else if(key!=previous){
             A->backlight_on();
-            if(key==APP_KEY_EXIT){
+            if(key==APP_KEY_2){
+                if(g.mode == MODE_TEMPERATURE) rf_enter();
+                else rf_exit();
+            } else if(key==APP_KEY_3 && g.rf_active){
+                g.rf_monitor = !g.rf_monitor;
+                A->audio_path(g.rf_monitor);
+                g.dirty = true;
+            } else if(key==APP_KEY_UP){
+                if(g.mode == MODE_RF){
+                    g.rf_shift_khz += 1;
+                    rf_set_freq_from_vfo();
+                    g.rf_bit_count = 0u;
+                    g.rf_bits[0] = '\0';
+                    g.dirty = true;
+                } else {
+                    g.comp_offset_tenths-=5;
+                    if(g.comp_offset_tenths<-50) g.comp_offset_tenths=-50;
+                    if(g.comp_offset_tenths>200) g.comp_offset_tenths=200;
+                    g.ambient_tenths=g.filtered_raw*10-g.comp_offset_tenths;
+                    g.dirty=true; g.cfg_dirty=true; save_delay=0;
+                }
+            } else if(key==APP_KEY_DOWN){
+                if(g.mode == MODE_RF){
+                    g.rf_shift_khz -= 1;
+                    rf_set_freq_from_vfo();
+                    g.rf_bit_count = 0u;
+                    g.rf_bits[0] = '\0';
+                    g.dirty = true;
+                } else {
+                    g.comp_offset_tenths+=5;
+                    if(g.comp_offset_tenths>200) g.comp_offset_tenths=200;
+                    if(g.comp_offset_tenths<-50) g.comp_offset_tenths=-50;
+                    g.ambient_tenths=g.filtered_raw*10-g.comp_offset_tenths;
+                    g.dirty=true; g.cfg_dirty=true; save_delay=0;
+                }
+            } else if(key==APP_KEY_EXIT){
+                if(g.mode == MODE_RF) rf_exit();
                 if(g.cfg_dirty) cfg_save();
                 g.running=false;
-            } else if(key==APP_KEY_UP){
-                // odwrócone dla intuicji: UP = cieplej
-                g.comp_offset_tenths-=5;
-                if(g.comp_offset_tenths<-50) g.comp_offset_tenths=-50;
-                if(g.comp_offset_tenths>200) g.comp_offset_tenths=200;
-                g.ambient_tenths=g.filtered_raw*10-g.comp_offset_tenths;
-                g.dirty=true; g.cfg_dirty=true; save_delay=0;
-            } else if(key==APP_KEY_DOWN){
-                g.comp_offset_tenths+=5;
-                if(g.comp_offset_tenths>200) g.comp_offset_tenths=200;
-                if(g.comp_offset_tenths<-50) g.comp_offset_tenths=-50;
-                g.ambient_tenths=g.filtered_raw*10-g.comp_offset_tenths;
-                g.dirty=true; g.cfg_dirty=true; save_delay=0;
             } else if(key==APP_KEY_MENU){
-                g.show_f=!g.show_f; g.dirty=true;
+                if(g.mode == MODE_TEMPERATURE){ g.show_f=!g.show_f; g.dirty=true; }
             } else {
-                A->play_tone(500,60);
+                if(g.mode == MODE_TEMPERATURE) A->play_tone(500,60);
             }
             previous=key;
         } else {
-            if(key==APP_KEY_UP || key==APP_KEY_DOWN){
+            if(g.mode == MODE_TEMPERATURE && (key==APP_KEY_UP || key==APP_KEY_DOWN)){
                 if(repeat_ms>200){
                     repeat_ms=0;
                     if(key==APP_KEY_UP) g.comp_offset_tenths-=5; else g.comp_offset_tenths+=5;
@@ -306,6 +459,24 @@ void app_main(const app_api_t *api){
                     g.ambient_tenths=g.filtered_raw*10-g.comp_offset_tenths;
                     g.dirty=true; g.cfg_dirty=true;
                 }
+            }
+            if(g.mode == MODE_RF && (key==APP_KEY_UP || key==APP_KEY_DOWN)){
+                if(repeat_ms>150){
+                    repeat_ms=0;
+                    if(key==APP_KEY_UP) g.rf_shift_khz += 1; else g.rf_shift_khz -= 1;
+                    rf_set_freq_from_vfo();
+                    g.rf_bit_count = 0u;
+                    g.rf_bits[0] = '\0';
+                    g.dirty=true;
+                }
+            }
+        }
+
+        if(g.mode == MODE_RF){
+            rf_sample_bitstream();
+            if(g.rf_monitor) {
+                A->audio_path(true);
+                A->set_af(APP_AF_AM);
             }
         }
 
@@ -316,7 +487,7 @@ void app_main(const app_api_t *api){
 
         if(!g.suspended){
             tick_cnt++;
-            if(tick_cnt>=TEMP_REFRESH_TICKS){ tick_cnt=0; refresh_temperature(); g.dirty=true; }
+            if(g.mode == MODE_TEMPERATURE && tick_cnt>=TEMP_REFRESH_TICKS){ tick_cnt=0; refresh_temperature(); g.dirty=true; }
             if(g.cfg_dirty){
                 save_delay+=INPUT_TICK_MS;
                 if(save_delay>2000){ cfg_save(); save_delay=0; }
@@ -325,4 +496,3 @@ void app_main(const app_api_t *api){
         A->backlight_update();
     }
 }
-
