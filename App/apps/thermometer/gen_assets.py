@@ -1,10 +1,36 @@
 #!/usr/bin/env python3
+# Thermometer read-only assets: title and labels, plus the 5x7 glyph font used
+# by the big temperature digits and the uppercase C/F markers.
+#
+#   ./gen_assets.py thermometer_assets.bin thermometer_assets.h
 import os, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from app_assets import Assets
 
-# Thermometer nie potrzebuje dużych zasobów - tylko tytuł, wszystko inne rysowane jest bezpośrednio na FB
+FONT5X7_DIGITS = [
+    [0x3E, 0x51, 0x49, 0x45, 0x3E],  # 0
+    [0x00, 0x42, 0x7F, 0x40, 0x00],  # 1
+    [0x42, 0x61, 0x51, 0x49, 0x46],  # 2
+    [0x21, 0x41, 0x45, 0x4B, 0x31],  # 3
+    [0x18, 0x14, 0x12, 0x7F, 0x10],  # 4
+    [0x27, 0x45, 0x45, 0x45, 0x39],  # 5
+    [0x3C, 0x4A, 0x49, 0x49, 0x30],  # 6
+    [0x01, 0x71, 0x09, 0x05, 0x03],  # 7
+    [0x36, 0x49, 0x49, 0x49, 0x36],  # 8
+    [0x06, 0x49, 0x49, 0x29, 0x1E],  # 9
+    [0x00, 0x08, 0x08, 0x08, 0x00],  # -
+    [0x00, 0x00, 0x60, 0x60, 0x00],  # .
+    [0x3E, 0x41, 0x41, 0x41, 0x22],  # C
+    [0x7F, 0x09, 0x09, 0x09, 0x01],  # F
+]
+
+# Asset order matches the glyph lookup in thermometer_app.c: 0..9, -, ., C, F.
 a = Assets("THERMOMETER")
 a.text("T_TITLE", "THERMOMETER")
+a.text("T_ADC_ERR", "ADC ERR")
+a.text("T_RAW", "RAW:")
+a.text("T_CMP", "CMP:")
+a.text("T_VDD", "VDD:")
+a.u8("FONT5X7_GLYPHS", [b for glyph in FONT5X7_DIGITS for b in glyph])
 a.main()

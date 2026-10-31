@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "../app_api.h"
+#include "thermometer_assets.h"
 
 #define ADC1_ADDRESS            0x40012400u
 #define ADC_SR_EOC              (1u << 1)
@@ -29,23 +30,6 @@ struct thermo_cfg {
     uint16_t magic;
 };
 #define CFG_MAGIC 0x5448
-
-static const uint8_t font5x7_digits[12][5] = {
-    {0x3E,0x51,0x49,0x45,0x3E},
-    {0x00,0x42,0x7F,0x40,0x00},
-    {0x42,0x61,0x51,0x49,0x46},
-    {0x21,0x41,0x45,0x4B,0x31},
-    {0x18,0x14,0x12,0x7F,0x10},
-    {0x27,0x45,0x45,0x45,0x39},
-    {0x3C,0x4A,0x49,0x49,0x30},
-    {0x01,0x71,0x09,0x05,0x03},
-    {0x36,0x49,0x49,0x49,0x36},
-    {0x06,0x49,0x49,0x29,0x1E},
-    {0x00,0x08,0x08,0x08,0x00},
-    {0x00,0x00,0x60,0x60,0x00},
-};
-static const uint8_t font5x7_C[5] = {0x3E,0x41,0x41,0x41,0x22};
-static const uint8_t font5x7_F[5] = {0x7F,0x09,0x09,0x09,0x01};
 
 struct globals {
     const app_api_t *api;
@@ -151,17 +135,24 @@ static void fb_set_pixel(uint8_t x, uint8_t y, bool on) {
 static void fb_fill_rect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, bool on) {
     for(uint8_t dy=0;dy<h;dy++) for(uint8_t dx=0;dx<w;dx++) fb_set_pixel(x+dx,y+dy,on);
 }
+
+static uint8_t font_index_for_char(char c) {
+    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+    if (c == '-') return 10u;
+    if (c == '.') return 11u;
+    if (c == 'C' || c == 'c') return 12u;
+    if (c == 'F' || c == 'f') return 13u;
+    return 0u;
+}
+
 static void draw_char_5x7_scaled(uint8_t x, uint8_t y, char c, uint8_t scale, bool on) {
-    const uint8_t *col_data=NULL;
-    if (c>='0' && c<='9') col_data=font5x7_digits[c-'0'];
-    else if (c=='-') col_data=font5x7_digits[10];
-    else if (c=='.') col_data=font5x7_digits[11];
-    else if (c=='C'||c=='c') col_data=font5x7_C;
-    else if (c=='F'||c=='f') col_data=font5x7_F;
-    else return;
-    for(uint8_t cx=0;cx<5;cx++){
+    const uint8_t glyph_index = font_index_for_char(c);
+    uint8_t col_data[5];
+    if (glyph_index > 13u) return;
+    A->asset_read(FONT5X7_GLYPHS + glyph_index * 5u, col_data, sizeof(col_data));
+    for(uint8_t cx=0;cx<5;cx++) {
         uint8_t col=col_data[cx];
-        for(uint8_t cy=0;cy<7;cy++){
+        for(uint8_t cy=0;cy<7;cy++) {
             if((col>>cy)&1) fb_fill_rect(x+cx*scale, y+cy*scale, scale, scale, on);
         }
     }
@@ -182,13 +173,16 @@ static void format_temp_big(char *out, int16_t tenths, bool fahrenheit){
 
 static void draw(void){
     char buf[16]; char small[32];
+    char title[T_TITLE_LEN];
+    char adc_err[T_ADC_ERR_LEN];
+    A->asset_read(T_TITLE, title, sizeof(title));
     A->display_clear();
     A->status_clear();
-    A->print_normal("THERMOMETER", 0, 0, 0);
+    A->print_normal(title, 0, 0, 0);
     A->draw_battery();
     A->blit_status();
 
-    if(!g.valid){ draw_big_text(24,14,"--C",3); A->print_normal("ADC ERR", 0,0,6); A->blit_full(); return; }
+    if(!g.valid){ draw_big_text(24,14,"--C",3); A->asset_read(T_ADC_ERR, adc_err, sizeof(adc_err)); A->print_normal(adc_err, 0,0,6); A->blit_full(); return; }
 
     int16_t disp = g.ambient_tenths;
     if(g.show_f){ int32_t f=(int32_t)g.ambient_tenths*9/5+320; disp=(int16_t)f; }
@@ -203,8 +197,12 @@ static void draw(void){
     draw_big_text(x0,y0,buf,scale);
 
     {
+        char raw_label[T_RAW_LEN];
+        char cmp_label[T_CMP_LEN];
+        A->asset_read(T_RAW, raw_label, sizeof(raw_label));
+        A->asset_read(T_CMP, cmp_label, sizeof(cmp_label));
         char *o=small;
-        o[0]='R';o[1]='A';o[2]='W';o[3]=':';o+=4;
+        for(const char *p = raw_label; *p; p++) *o++ = *p;
         int16_t raw=g.filtered_raw;
         bool neg=false;
         if(raw<0){ neg=true; raw=-raw; }
@@ -213,7 +211,7 @@ static void draw(void){
         *o++='0'+(raw%10);
         *o++='C';
         *o++=' ';
-        o[0]='C';o[1]='M';o[2]='P';o[3]=':';o+=4;
+        for(const char *p = cmp_label; *p; p++) *o++ = *p;
         // odwrócony plus/minus dla intuicji: wyswietlamy -offset (korekta dodawana do RAW)
         int16_t disp_off = -g.comp_offset_tenths;
         if(disp_off==0){
@@ -236,8 +234,10 @@ static void draw(void){
         A->print_normal(small,0,0,5);
     }
     {
+        char vdd_label[T_VDD_LEN];
+        A->asset_read(T_VDD, vdd_label, sizeof(vdd_label));
         char *o=small;
-        o[0]='V';o[1]='D';o[2]='D';o[3]=':';o+=4;
+        for(const char *p = vdd_label; *p; p++) *o++ = *p;
         uint16_t v=g.vdd_mv;
         *o++='0'+v/1000; *o++='.'; *o++='0'+(v%1000)/100; *o++='0'+(v%100)/10; *o++='V'; *o++=' ';
         if(A->sys_battery_voltage){
@@ -325,3 +325,4 @@ void app_main(const app_api_t *api){
         A->backlight_update();
     }
 }
+
